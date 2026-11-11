@@ -41,6 +41,14 @@ def init_db():
                 created_at INTEGER NOT NULL
             )
         """)
+        user_columns = {
+            row["name"] for row in connection.execute("PRAGMA table_info(users)")
+        }
+        if "role" not in user_columns:
+            connection.execute(
+                "ALTER TABLE users ADD COLUMN role TEXT NOT NULL DEFAULT 'user' "
+                "CHECK (role IN ('user', 'admin'))"
+            )
         connection.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 token_hash TEXT PRIMARY KEY,
@@ -48,7 +56,22 @@ def init_db():
                 expires_at INTEGER NOT NULL
             )
         """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS posts (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                media_type TEXT NOT NULL CHECK (media_type IN ('none', 'image', 'video')),
+                media_url TEXT NOT NULL DEFAULT '',
+                is_sponsored INTEGER NOT NULL DEFAULT 0 CHECK (is_sponsored IN (0, 1)),
+                author_id INTEGER NOT NULL REFERENCES users(id),
+                created_at INTEGER NOT NULL
+            )
+        """)
         connection.execute("CREATE INDEX IF NOT EXISTS sessions_expiry ON sessions(expires_at)")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS posts_created ON posts(is_sponsored, created_at DESC)"
+        )
 
 
 def hash_password(password, salt=None):
@@ -128,7 +151,7 @@ class SmartDecisionHandler(BaseHTTPRequestHandler):
         with connect_db() as connection:
             connection.execute("DELETE FROM sessions WHERE expires_at <= ?", (now,))
             row = connection.execute("""
-                SELECT users.id, users.name, users.email
+                SELECT users.id, users.name, users.email, users.role
                 FROM sessions JOIN users ON users.id = sessions.user_id
                 WHERE sessions.token_hash = ? AND sessions.expires_at > ?
             """, (token_hash, now)).fetchone()
@@ -158,6 +181,17 @@ class SmartDecisionHandler(BaseHTTPRequestHandler):
             else:
                 self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Требуется войти в аккаунт."})
             return
+        if path == "/api/content":
+            with connect_db() as connection:
+                posts = connection.execute("""
+                    SELECT posts.id, posts.title, posts.body, posts.media_type,
+                           posts.media_url, posts.is_sponsored, posts.created_at,
+                           users.name AS author_name
+                    FROM posts JOIN users ON users.id = posts.author_id
+                    ORDER BY posts.is_sponsored DESC, posts.created_at DESC, posts.id DESC
+                """).fetchall()
+            self.send_json(HTTPStatus.OK, {"posts": [dict(post) for post in posts]})
+            return
         if path not in ("/", "/index.html"):
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -174,7 +208,7 @@ class SmartDecisionHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in ("/api/register", "/api/login", "/api/logout"):
+        if path not in ("/api/register", "/api/login", "/api/logout", "/api/content"):
             self.send_json(HTTPStatus.NOT_FOUND, {"error": "Неизвестный адрес."})
             return
         if not self.origin_is_same_site():
@@ -189,8 +223,88 @@ class SmartDecisionHandler(BaseHTTPRequestHandler):
             self.register(data)
         elif path == "/api/login":
             self.login(data)
-        else:
+        elif path == "/api/logout":
             self.logout()
+        else:
+            self.create_post(data)
+
+    def do_DELETE(self):
+        path = urlparse(self.path).path
+        prefix = "/api/content/"
+        if not path.startswith(prefix):
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "Публикация не найдена."})
+            return
+        post_id_text = path[len(prefix):]
+        if not post_id_text.isdecimal():
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "Публикация не найдена."})
+            return
+        if not self.origin_is_same_site():
+            self.send_json(HTTPStatus.FORBIDDEN, {"error": "Запрос отклонён."})
+            return
+        user = self.current_user()
+        if not user:
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Требуется войти в аккаунт."})
+            return
+        if user["role"] != "admin":
+            self.send_json(HTTPStatus.FORBIDDEN, {"error": "Недостаточно прав."})
+            return
+        with connect_db() as connection:
+            cursor = connection.execute("DELETE FROM posts WHERE id = ?", (int(post_id_text),))
+        if cursor.rowcount == 0:
+            self.send_json(HTTPStatus.NOT_FOUND, {"error": "Публикация не найдена."})
+            return
+        self.send_json(HTTPStatus.OK, {"ok": True})
+
+    def create_post(self, data):
+        user = self.current_user()
+        if not user:
+            self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Требуется войти в аккаунт."})
+            return
+        if user["role"] != "admin":
+            self.send_json(HTTPStatus.FORBIDDEN, {"error": "Недостаточно прав."})
+            return
+
+        title = data.get("title")
+        body = data.get("body")
+        media_type = data.get("media_type", "none")
+        media_url = data.get("media_url", "")
+        is_sponsored = data.get("is_sponsored", False)
+        if not isinstance(title, str) or not isinstance(body, str):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Укажите заголовок и текст публикации."})
+            return
+        title = title.strip()
+        body = body.strip()
+        if not title or len(title) > 160:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Заголовок должен содержать от 1 до 160 символов."})
+            return
+        if not body or len(body) > 10_000:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Текст публикации должен содержать от 1 до 10000 символов."})
+            return
+        if media_type not in ("none", "image", "video"):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Выберите корректный тип медиа."})
+            return
+        if not isinstance(media_url, str) or len(media_url) > 2048:
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Ссылка на медиа слишком длинная."})
+            return
+        media_url = media_url.strip()
+        if media_type == "none":
+            media_url = ""
+        elif not valid_media_url(media_url):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Укажите корректную ссылку на фото или видео (http/https)."})
+            return
+        if not isinstance(is_sponsored, bool):
+            self.send_json(HTTPStatus.BAD_REQUEST, {"error": "Некорректный признак рекламной публикации."})
+            return
+
+        with connect_db() as connection:
+            cursor = connection.execute("""
+                INSERT INTO posts(title, body, media_type, media_url, is_sponsored, author_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (
+                title, body, media_type, media_url, int(is_sponsored),
+                user["id"], int(time.time()),
+            ))
+        self.send_json(HTTPStatus.CREATED, {"id": cursor.lastrowid})
 
     def register(self, data):
         name = data.get("name")
@@ -221,7 +335,7 @@ class SmartDecisionHandler(BaseHTTPRequestHandler):
         except sqlite3.IntegrityError:
             self.send_json(HTTPStatus.CONFLICT, {"error": "Аккаунт с этой почтой уже зарегистрирован."})
             return
-        user = {"id": user_id, "name": name, "email": email}
+        user = {"id": user_id, "name": name, "email": email, "role": "user"}
         self.send_json(
             HTTPStatus.CREATED,
             {"user": user},
@@ -236,13 +350,15 @@ class SmartDecisionHandler(BaseHTTPRequestHandler):
             return
         with connect_db() as connection:
             user = connection.execute(
-                "SELECT id, name, email, password_hash FROM users WHERE email = ? COLLATE NOCASE",
+                "SELECT id, name, email, role, password_hash FROM users WHERE email = ? COLLATE NOCASE",
                 (email.strip(),),
             ).fetchone()
         if not user or not verify_password(password, user["password_hash"]):
             self.send_json(HTTPStatus.UNAUTHORIZED, {"error": "Неверная почта или пароль."})
             return
-        public_user = {"id": user["id"], "name": user["name"], "email": user["email"]}
+        public_user = {
+            "id": user["id"], "name": user["name"], "email": user["email"], "role": user["role"]
+        }
         self.send_json(
             HTTPStatus.OK,
             {"user": public_user},
@@ -264,6 +380,21 @@ class SmartDecisionHandler(BaseHTTPRequestHandler):
     def log_message(self, format_string, *args):
         # Keep standard request logging without logging form contents or credentials.
         super().log_message(format_string, *args)
+
+
+def valid_media_url(value):
+    if not value or any(character.isspace() for character in value):
+        return False
+    try:
+        parsed = urlparse(value)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in ("http", "https")
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+    )
 
 
 if __name__ == "__main__":
